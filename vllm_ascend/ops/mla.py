@@ -29,8 +29,14 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
+
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    can_use_sp_mm_reduce_scatter,
+)
 
 
 class IndexerWrapper(nn.Module):
@@ -148,6 +154,17 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def enable_mm_reduce_scatter(self) -> bool:
+        impl = self.mla_attn.impl
+        o_proj = impl.o_proj
+        enabled = can_use_sp_mm_reduce_scatter(o_proj)
+        impl.use_mm_reduce_scatter = enabled
+        return enabled
+
+    @property
+    def uses_mm_reduce_scatter(self) -> bool:
+        return bool(getattr(self.mla_attn.impl, "use_mm_reduce_scatter", False) and _EXTRA_CTX.mmrs_fusion)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -156,8 +173,13 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         hidden_dim = self.hidden_size
+        output_tokens = (
+            cdiv(hidden_states.shape[0], self.tp_size) if self.uses_mm_reduce_scatter else hidden_states.shape[0]
+        )
         output = torch.empty(
-            (hidden_states.shape[0], hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (output_tokens, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
 
         torch.ops.vllm.mla_forward(hidden_states, output, self.prefix)

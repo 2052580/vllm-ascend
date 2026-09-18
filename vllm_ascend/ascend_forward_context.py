@@ -35,6 +35,12 @@ _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
 
 
+def supports_mm_reduce_scatter(tp_world_size: int) -> bool:
+    if get_ascend_device_type() == AscendDeviceType.A3:
+        return tp_world_size in (2, 4, 8, 16, 32)
+    return tp_world_size in (2, 4, 8)
+
+
 def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:
@@ -162,8 +168,7 @@ def set_ascend_forward_context(
         # TODO: remove it when fia merge in fiav2
         forward_context.sinks = has_sinks
 
-        # TODO: remove it when torch_npu.npu_mm_reduce_scatter_base supports tp_size >= 16.
-        mmrs_fusion = tp_world_size <= 8
+        mmrs_fusion = supports_mm_reduce_scatter(tp_world_size)
 
         forward_context.mmrs_fusion = mmrs_fusion
         forward_context.num_tokens = num_tokens

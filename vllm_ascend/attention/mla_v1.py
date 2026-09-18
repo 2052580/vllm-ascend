@@ -47,6 +47,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
+from vllm_ascend.models.common.ops.sequence_parallel import sp_mm_reduce_scatter
 from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
 from vllm_ascend.quantization.methods import AscendW8A8LinearMethod, AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -1990,7 +1991,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         if gate is not None:
             o_proj_input.mul_(torch.sigmoid(gate))
         # O proj
-        output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
+        if getattr(self, "use_mm_reduce_scatter", False) and _EXTRA_CTX.mmrs_fusion:
+            output[...] = sp_mm_reduce_scatter(o_proj_input, self.o_proj.weight)
+        else:
+            output[...] = self.o_proj(o_proj_input, is_prefill=prefill_preprocess_res is not None)[0]
 
         del o_proj_input
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))

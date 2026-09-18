@@ -27,6 +27,11 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    can_use_sp_mm_reduce_scatter,
+    sp_mm_reduce_scatter,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
@@ -186,7 +191,13 @@ def _prepare_beta(
 class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
     """Kimi K3 KDA using AscendC prefill and recurrent kernels."""
 
-    def __init__(self, config, vllm_config, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config,
+        vllm_config,
+        prefix: str = "",
+        use_sequence_parallel: bool = False,
+    ) -> None:
         quant_config = getattr(vllm_config, "quant_config", None)
         uses_mixed_projection = bool(
             quant_config is not None
@@ -198,6 +209,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         )
         super().__init__(config, vllm_config, prefix)
         self.uses_mixed_projection = uses_mixed_projection
+        self._enable_mm_reduce_scatter = (
+            uses_mixed_projection and use_sequence_parallel and can_use_sp_mm_reduce_scatter(self.o_proj)
+        )
         if uses_mixed_projection:
             # vLLM 0.27 packs all KDA input projections into one linear.  A
             # QuaRot checkpoint instead stores q/k/v as W8A8 and keeps B/F/G
@@ -279,8 +293,14 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 beta_is_preprocessed=True,
             )
             core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+            if self.uses_mm_reduce_scatter:
+                return sp_mm_reduce_scatter(core_attn_out, self.o_proj.weight)
             return self.o_proj(core_attn_out)[0]
         return super().forward(hidden_states, positions)
+
+    @property
+    def uses_mm_reduce_scatter(self) -> bool:
+        return bool(getattr(self, "_enable_mm_reduce_scatter", False) and _EXTRA_CTX.mmrs_fusion)
 
     def _run_overlapped_qkv_bfg(
         self,

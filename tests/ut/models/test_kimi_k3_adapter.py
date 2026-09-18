@@ -227,6 +227,52 @@ def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
     assert returned_residual.shape == torch.Size([2, 1, 2])
 
 
+def test_kimi_attention_skips_separate_reduce_scatter_when_fused(monkeypatch):
+    class FusedAttention(nn.Module):
+        uses_mm_reduce_scatter = True
+
+        def forward(self, *, hidden_states, positions):
+            del positions
+            return hidden_states[:2]
+
+    layer = kimi_k3.AscendKimiDecoderLayer.__new__(kimi_k3.AscendKimiDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.use_sequence_parallel = True
+    layer.prev_valid_blocks = 0
+    layer.is_block_write_layer = False
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = nn.Identity()
+    layer.mlp = nn.Identity()
+    layer.self_attention_res_proj = object()
+    layer.self_attention_res_norm = object()
+    layer.mlp_res_proj = object()
+    layer.mlp_res_norm = object()
+    layer.self_attn = FusedAttention()
+
+    monkeypatch.setattr(
+        kimi_k3,
+        "sp_all_gather",
+        lambda hidden_states: torch.cat((hidden_states, hidden_states), dim=0),
+    )
+    reduce_scatter = MagicMock()
+    monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", reduce_scatter)
+    monkeypatch.setattr(
+        kimi_k3,
+        "_apply_ascend_attn_res",
+        lambda prefix_sum, *_args, **_kwargs: prefix_sum,
+    )
+
+    hidden_states = torch.arange(4, dtype=torch.float32).view(2, 2)
+    output, _ = layer.forward_attn_residual(
+        positions=torch.arange(3),
+        hidden_states=hidden_states,
+        block_residual=torch.zeros(2, 1, 2),
+    )
+
+    reduce_scatter.assert_not_called()
+    assert output.shape == torch.Size([2, 2])
+
+
 def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
     class RecordingLayer(nn.Module):
         def __init__(self):

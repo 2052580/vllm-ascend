@@ -298,6 +298,7 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         prefix: str = "",
         non_causal_multi_token_decode: bool = False,
         disable_mlapo: bool = False,
+        use_sequence_parallel: bool = False,
     ) -> None:
         upstream_config = copy(config)
         upstream_config.mla_use_output_gate = use_output_gate
@@ -318,6 +319,8 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
         attention_layer = self._attention_layer
         if disable_mlapo:
             attention_layer.impl.enable_mlapo = False
+        if use_sequence_parallel:
+            self.mla_attn.enable_mm_reduce_scatter()
         if not use_rope and not non_causal_multi_token_decode:
             return
 
@@ -379,6 +382,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     def _k_scale(self):
         return self._attention_layer._k_scale
 
+    @property
+    def uses_mm_reduce_scatter(self) -> bool:
+        return self.mla_attn.uses_mm_reduce_scatter
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -412,6 +419,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
                 config,
                 vllm_config,
                 prefix=f"{prefix}.self_attn",
+                use_sequence_parallel=use_sequence_parallel,
             )
         else:
             qk_nope_head_dim = config.qk_nope_head_dim
@@ -437,6 +445,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                use_sequence_parallel=use_sequence_parallel,
             )
 
         self.is_moe_layer = (
@@ -542,7 +551,11 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
             hidden_states=hidden_states,
             positions=positions,
         )
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel and not getattr(
+            self.self_attn,
+            "uses_mm_reduce_scatter",
+            False,
+        ):
             hidden_states = sp_reduce_scatter(hidden_states)
 
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states

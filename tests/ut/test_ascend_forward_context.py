@@ -96,6 +96,30 @@ def _patch_select_moe_comm_method_deps(
     )
 
 
+@pytest.mark.parametrize(
+    ("device_type", "tp_world_size", "expected"),
+    [
+        (afc.AscendDeviceType.A2, 8, True),
+        (afc.AscendDeviceType.A2, 16, False),
+        (afc.AscendDeviceType.A3, 16, True),
+        (afc.AscendDeviceType.A3, 32, True),
+    ],
+)
+def test_supports_mm_reduce_scatter(
+    monkeypatch,
+    device_type,
+    tp_world_size,
+    expected,
+):
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_device_type",
+        lambda: device_type,
+    )
+
+    assert afc.supports_mm_reduce_scatter(tp_world_size) is expected
+
+
 def test_deepseek_v4_forward_passes_input_ids_to_layers(monkeypatch):
     from vllm.forward_context import ForwardContext, override_forward_context
 

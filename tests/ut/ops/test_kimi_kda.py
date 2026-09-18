@@ -266,6 +266,45 @@ def test_mixed_forward_marks_auxiliary_beta_as_preprocessed():
     assert attention._forward.call_args.kwargs["beta_is_preprocessed"] is True
 
 
+def test_mixed_forward_uses_mm_reduce_scatter_for_o_proj():
+    attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
+    nn.Module.__init__(attention)
+    attention.uses_mixed_projection = True
+    attention._enable_mm_reduce_scatter = True
+    attention.local_num_heads = 2
+    attention.head_dim = 3
+    hidden_states = torch.randn(4, 6)
+    mixed_qkv = torch.randn(4, 18)
+    attention._run_overlapped_qkv_bfg = MagicMock(
+        return_value=(
+            mixed_qkv,
+            torch.rand(1, 4, 2),
+            torch.randn(1, 4, 2, 3),
+            torch.randn(4, 2, 3),
+        )
+    )
+    attention._forward = MagicMock()
+    attention.o_proj = _RecordingLinear(torch.empty(4, 6))
+    attention.o_proj.weight = nn.Parameter(torch.randn(6, 6))
+    expected = torch.randn(2, 6)
+
+    with (
+        patch(
+            "vllm_ascend.ops.kimi_kda._EXTRA_CTX",
+            SimpleNamespace(mmrs_fusion=True),
+        ),
+        patch(
+            "vllm_ascend.ops.kimi_kda.sp_mm_reduce_scatter",
+            return_value=expected,
+        ) as mmrs,
+    ):
+        actual = attention.forward(hidden_states, torch.arange(4))
+
+    assert actual is expected
+    mmrs.assert_called_once()
+    assert mmrs.call_args.args[1] is attention.o_proj.weight
+
+
 def test_overlapped_qkv_bfg_keeps_two_stage_vector_cube_overlap():
     attention = AscendKimiK3DeltaAttention.__new__(AscendKimiK3DeltaAttention)
     nn.Module.__init__(attention)

@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from vllm.config import CacheConfig, CompilationConfig, VllmConfig
 from vllm.forward_context import ForwardContext
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mla import MLAModules
 
 from tests.ut.base import TestBase
@@ -159,3 +160,61 @@ class TestAscendMultiHeadLatentAttention(TestBase):
         output = attn.forward(positions, hidden_states)
 
         self.assertEqual(output.shape, (3, self.hidden_size))
+
+    @patch("vllm_ascend.ops.mla._EXTRA_CTX")
+    @patch("vllm_ascend.ops.mla.torch.ops.vllm.mla_forward")
+    @patch("vllm_ascend.ops.mla.get_current_vllm_config")
+    @patch("vllm_ascend.ops.mla.get_tensor_model_parallel_world_size")
+    def test_mm_reduce_scatter_allocates_sequence_shard(
+        self,
+        mock_tp_size,
+        mock_get_vllm_config,
+        mock_mla_forward,
+        mock_extra_ctx,
+    ):
+        mock_tp_size.return_value = 4
+        mock_extra_ctx.mmrs_fusion = True
+        mock_vllm_config = MagicMock(spec=VllmConfig)
+        mock_vllm_config.model_config.hf_text_config = MagicMock(
+            num_hidden_layers=32,
+            first_k_dense_replace=False,
+        )
+        mock_vllm_config.compilation_config = CompilationConfig()
+        mock_get_vllm_config.return_value = mock_vllm_config
+
+        o_proj = MagicMock()
+        o_proj.quant_method = UnquantizedLinearMethod()
+        o_proj.bias = None
+        o_proj.weight = torch.empty(8, 8, dtype=torch.bfloat16)
+        mock_mla_attn = MagicMock()
+        mock_mla_attn.process_weights_after_loading = MagicMock()
+        mock_mla_attn.impl = MagicMock(o_proj=o_proj)
+        mock_mla_attn.impl.process_weights_after_loading = MagicMock()
+
+        with patch(
+            "vllm_ascend.ops.mla.MLAAttention",
+            return_value=mock_mla_attn,
+        ):
+            attn = AscendMultiHeadLatentAttention(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
+                scale=self.scale,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                mla_modules=self.mock_mla_modules,
+                cache_config=self.mock_cache_config,
+                quant_config=self.mock_quant_config,
+                prefix=self.prefix,
+            )
+
+        assert attn.enable_mm_reduce_scatter()
+        output = attn.forward(
+            torch.arange(5),
+            torch.randn(5, self.hidden_size),
+        )
+
+        self.assertEqual(output.shape, (2, self.hidden_size))
+        mock_mla_forward.assert_called_once()
